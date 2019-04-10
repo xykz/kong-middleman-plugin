@@ -1,8 +1,6 @@
-local JSON = require "kong.plugins.middleman.json"
 local cjson = require "cjson"
 local url = require "socket.url"
-
-local string_format = string.format
+local http = require "resty.http"
 
 local kong_response = kong.response
 
@@ -11,8 +9,6 @@ local get_uri_args = ngx.req.get_uri_args
 local read_body = ngx.req.read_body
 local get_body = ngx.req.get_body_data
 local get_method = ngx.req.get_method
-local ngx_re_match = ngx.re.match
-local ngx_re_find = ngx.re.find
 
 local HTTP = "http"
 local HTTPS = "https"
@@ -39,111 +35,105 @@ function _M.execute(conf)
     return
   end
 
-  local name = "[middleman] "
+  kong_response.set_header("Content-Type", conf.response)
+
   local ok, err
   local parsed_url = parse_url(conf.url)
   local host = parsed_url.host
   local port = tonumber(parsed_url.port)
-  local payload = _M.compose_payload(parsed_url)
+  local payload = _M.compose_payload(parsed_url, conf)
 
-  local sock = ngx.socket.tcp()
-  sock:settimeout(conf.timeout)
+  local httpc = http.new()
+  httpc:set_timeout(conf.timeout)
 
-  ok, err = sock:connect(host, port)
+  ok, err = httpc:connect(host, port)
   if not ok then
-    ngx.log(ngx.ERR, name .. "failed to connect to " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
+    kong.log.err("failed to connect to " .. host .. ":" .. tostring(port) .. ": ", err)
+    return _M.compose_err_response(err)
   end
 
   if parsed_url.scheme == HTTPS then
-    local _, err = sock:sslhandshake(true, host, false)
+    local _, err = httpc:ssl_handshake(true, host, false)
     if err then
-      ngx.log(ngx.ERR, name .. "failed to do SSL handshake with " .. host .. ":" .. tostring(port) .. ": ", err)
+      kong.log.err("failed to do SSL handshake with " .. host .. ":" .. tostring(port) .. ": ", err)
     end
   end
 
-  ok, err = sock:send(payload)
-  if not ok then
-    ngx.log(ngx.ERR, name .. "failed to send data to " .. host .. ":" .. tostring(port) .. ": ", err)
-  end
-
-  local line, err = sock:receive("*l")
-
-  if err then 
-    ngx.log(ngx.ERR, name .. "failed to read response status from " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
-  end
-
-  local status_code = tonumber(string.match(line, "%s(%d%d%d)%s"))
-  local headers = {}
-
-  repeat
-    line, err = sock:receive("*l")
-    if err then
-      ngx.log(ngx.ERR, name .. "failed to read header " .. host .. ":" .. tostring(port) .. ": ", err)
-      return
-    end
-
-    local pair = ngx_re_match(line, "(.*):\\s*(.*)", "jo")
-
-    if pair then
-      headers[string.lower(pair[1])] = pair[2]
-    end
-  until ngx_re_find(line, "^\\s*$", "jo")
-
-  local body, err = sock:receive(tonumber(headers['content-length']))
+  local res, err = httpc:request({
+    path = parsed_url.path,
+    query = parsed_url.query,
+    body = payload,
+    method = "POST",
+    version = 1.1,
+    ssl_verify = false,
+    headers = {
+      ["Content-Type"] = "application/json",
+      ["Host"] = ngx.var.server_addr,
+      ["Connection"] = "Keep-Alive",
+      ["Content-Length"] = #payload
+    }
+  })
   if err then
-    ngx.log(ngx.ERR, name .. "failed to read body " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
+    kong.log.err("failed to request to " .. host .. ":" .. tostring(port) .. ": ", err)
+    return _M.compose_err_response(err)
   end
 
-  ok, err = sock:setkeepalive(conf.keepalive)
+  local body, err = res:read_body()
+  if err then
+    kong.log.err("failed to read body " .. host .. ":" .. tostring(port) .. ": ", err)
+    return _M.compose_err_response(err)
+  end
+
+  ok, err = httpc:set_keepalive(conf.keepalive)
   if not ok then
-    ngx.log(ngx.ERR, name .. "failed to keepalive to " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
+    kong.log.err("failed to keepalive to " .. host .. ":" .. tostring(port) .. ": ", err)
   end
 
+  local status_code = res.status
   if status_code > 299 then
-    if err then 
-      ngx.log(ngx.ERR, name .. "failed to read response from " .. host .. ":" .. tostring(port) .. ": ", err)
-    end
-
-    local response_body
-    if conf.response == "table" then 
-      response_body = JSON:decode(string.match(body, "%b{}"))
-    else
-      response_body = string.match(body, "%b{}")
-    end
-
-    return kong_response.send(status_code, response_body)
+    return kong_response.exit(status_code, body)
   end
-
 end
 
-function _M.compose_payload(parsed_url)
+function _M.compose_err_response(err)
+  local body = [[{"message":"]] .. err .. [["}]]
+  return kong_response.exit(500, body)
+end
+
+function _M.compose_payload(parsed_url, conf)
     local headers = get_headers()
     local uri_args = get_uri_args()
     local next = next
-    
-    read_body()
-    local body_data = get_body()
 
     headers["target_uri"] = ngx.var.request_uri
     headers["target_method"] = ngx.var.request_method
-
-    local url
-    if parsed_url.query then
-      url = parsed_url.path .. "?" .. parsed_url.query
-    else
-      url = parsed_url.path
-    end
     
-    local raw_json_headers = JSON:encode(headers)
-    local raw_json_body_data = JSON:encode(body_data)
+    -- 读取头部
+    local ok, raw_json_headers = pcall(cjson.encode, headers)
+    if not ok then
+      raw_json_headers = "{}"
+    end
 
+    -- 读取内容
+    local body_data
+    if conf.readbody then
+      read_body()
+      body_data = get_body()
+    end
+
+    local raw_json_body_data = string.match(body_data, "%b{}")
+
+    if not raw_json_body_data then
+      ok, raw_json_body_data = pcall(cjson.encode, body_data)
+      if not ok then
+        raw_json_body_data = "{}"
+      end
+    end
+
+    -- 读取参数
     local raw_json_uri_args
     if next(uri_args) then 
-      raw_json_uri_args = JSON:encode(uri_args) 
+      raw_json_uri_args = cjson.encode(uri_args) 
     else
       -- Empty Lua table gets encoded into an empty array whereas a non-empty one is encoded to JSON object.
       -- Set an empty object for the consistency.
@@ -151,12 +141,8 @@ function _M.compose_payload(parsed_url)
     end
 
     local payload_body = [[{"headers":]] .. raw_json_headers .. [[,"uri_args":]] .. raw_json_uri_args.. [[,"body_data":]] .. raw_json_body_data .. [[}]]
-    
-    local payload_headers = string_format(
-      "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nContent-Length: %s\r\n",
-      url, parsed_url.host, #payload_body)
-  
-    return string_format("%s\r\n%s", payload_headers, payload_body)
+
+    return payload_body
 end
 
 return _M
