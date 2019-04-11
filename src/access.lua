@@ -115,7 +115,7 @@ function _M.compose_payload(parsed_url, conf)
     end
 
     -- 读取内容
-    local body_data
+    local body_data = ""
     if conf.readbody then
       read_body()
       body_data = get_body()
