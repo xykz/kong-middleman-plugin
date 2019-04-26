@@ -115,19 +115,23 @@ function _M.compose_payload(parsed_url, conf)
     end
 
     -- 读取内容
-    local body_data = ""
+    local body_data
     if conf.readbody then
       read_body()
       body_data = get_body()
     end
 
-    local raw_json_body_data = string.match(body_data, "%b{}")
-
-    if not raw_json_body_data then
-      ok, raw_json_body_data = pcall(cjson.encode, body_data)
-      if not ok then
-        raw_json_body_data = "{}"
+    local raw_json_body_data
+    if type(body_data) == "string" then
+      raw_json_body_data = string.match(body_data, "%b{}")
+      if not raw_json_body_data then
+        ok, raw_json_body_data = pcall(cjson.encode, body_data)
+        if not ok then
+          raw_json_body_data = "{}"
+        end
       end
+    else
+      raw_json_body_data = "{}"
     end
 
     -- 读取参数
